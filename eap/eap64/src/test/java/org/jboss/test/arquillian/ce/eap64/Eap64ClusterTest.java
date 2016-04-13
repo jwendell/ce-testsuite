@@ -4,7 +4,6 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-import java.io.InputStream;
 import java.net.URL;
 import java.util.HashMap;
 import java.util.List;
@@ -27,6 +26,7 @@ import org.jboss.arquillian.ce.httpclient.HttpResponse;
 import org.jboss.arquillian.container.test.api.RunAsClient;
 import org.jboss.arquillian.junit.Arquillian;
 import org.jboss.arquillian.test.api.ArquillianResource;
+import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -36,17 +36,13 @@ import org.junit.runner.RunWith;
  */
 
 @RunWith(Arquillian.class)
-@Template(url = "https://raw.githubusercontent.com/jboss-openshift/application-templates/master/eap/eap64-basic-s2i.json",
-parameters = {
-        @TemplateParameter(name = "SOURCE_REPOSITORY_URL", value="https://github.com/jwendell/temp"),
-        @TemplateParameter(name = "SOURCE_REPOSITORY_REF", value="t1"),
-        @TemplateParameter(name = "CONTEXT_DIR", value="cluster1")
-        })
+@Template(url = "https://raw.githubusercontent.com/jboss-openshift/application-templates/master/eap/eap64-basic-s2i.json", parameters = {
+        @TemplateParameter(name = "SOURCE_REPOSITORY_URL", value = "https://github.com/jwendell/temp"),
+        @TemplateParameter(name = "SOURCE_REPOSITORY_REF", value = "t1"),
+        @TemplateParameter(name = "CONTEXT_DIR", value = "cluster1") })
 @OpenShiftResource("classpath:eap-app-secret.json")
-@RoleBindings({
-        @RoleBinding(roleRefName = "view", userName = "system:serviceaccount:${kubernetes.namespace}:default"),
-        @RoleBinding(roleRefName = "view", userName = "system:serviceaccount:${kubernetes.namespace}:eap-service-account")
-})
+@RoleBindings({ @RoleBinding(roleRefName = "view", userName = "system:serviceaccount:${kubernetes.namespace}:default"),
+        @RoleBinding(roleRefName = "view", userName = "system:serviceaccount:${kubernetes.namespace}:eap-service-account") })
 public class Eap64ClusterTest {
     private static final Logger log = Logger.getLogger(Eap64ClusterTest.class.getName());
 
@@ -56,43 +52,95 @@ public class Eap64ClusterTest {
     @ArquillianResource
     ConfigurationHandle config;
 
+    private String token;
+    private List<String> pods;
+    private HttpClient client;
+
+    @Before
+    public void Setup() throws Exception {
+        token = config.getToken();
+        assertFalse("Auth token must be provided", token.isEmpty());
+
+        client = HttpClientBuilder.untrustedConnectionClient();
+    }
+
+    /**
+     * This test starts two pods; insert a value into the first pod's session.
+     * Then it retrieves this value from the second pod.
+     * 
+     * After that it starts a third pod and try to get the value from it, to see
+     * if session replication is working at pod's startup as well.
+     * 
+     * @throws Exception
+     */
     @Test
     @RunAsClient
-	public void testSession() throws Exception {
-        final String token = config.getToken();
-        assertFalse(token.isEmpty());
+    public void testSession() throws Exception {
+        // Start with 2 pods
+        scale(2);
 
-        adapter.scaleDeployment("eap-app", 2);
-        List<String> pods = adapter.getPods();
-        pods.removeIf(p -> p.endsWith("-build") || !p.startsWith("eap-app-"));
-
-        HttpClient client = HttpClientBuilder.untrustedConnectionClient();
-        final String value = UUID.randomUUID().toString();
+        final String valueToCheck = UUID.randomUUID().toString();
 
         // Insert a session value into the first pod
         String servletUrl = buildURL(pods.get(0));
         HttpRequest request = HttpClientBuilder.doPOST(servletUrl);
         request.setHeader("Authorization", "Bearer " + token);
         Map<String, String> params = new HashMap<>();
-        params.put("key", value);
+        params.put("key", valueToCheck);
         request.setEntity(params);
         HttpResponse response = client.execute(request);
         assertEquals("OK", response.getResponseBodyAsString());
 
+        String cookie = response.getHeader("Set-Cookie");
+
         // Retrieve the value from the second pod
-        servletUrl = buildURL(pods.get(1));
-        request = HttpClientBuilder.doGET(servletUrl);
+        assertEquals(valueToCheck, retrieveKey(1, cookie));
+
+        // Now start a third shiny new pod and retrieve the value from it
+        scale(3);
+        assertEquals(valueToCheck, retrieveKey(2, cookie));
+    }
+
+    private void scale(int replicas) throws Exception {
+        adapter.scaleDeployment("eap-app", replicas);
+        pods = getPods();
+    }
+
+    private String retrieveKey(int podIndex, String cookie) throws Exception {
+        String servletUrl = buildURL(pods.get(podIndex));
+        HttpRequest request = HttpClientBuilder.doGET(servletUrl);
         request.setHeader("Authorization", "Bearer " + token);
-        request.setHeader("Cookie", response.getHeader("Set-Cookie"));
-        response = client.execute(request);
-        assertEquals(value, response.getResponseBodyAsString());
+        request.setHeader("Cookie", cookie);
+        return client.execute(request).getResponseBodyAsString();
+    }
+
+    private List<String> getPods() throws Exception {
+        List<String> pods = adapter.getPods();
+        pods.removeIf(p -> p.endsWith("-build") || !p.startsWith("eap-app-"));
+
+        return pods;
     }
 
     private String buildURL(String podName) {
         final String PROXY_URL = "%s/api/%s/namespaces/%s/pods/%s:%s/proxy%s";
-        return String.format(PROXY_URL, config.getKubernetesMaster(), config.getApiVersion(), config.getNamespace(), podName, 8080, "/cluster1/StoreInSession");
+        return String.format(PROXY_URL, config.getKubernetesMaster(), config.getApiVersion(), config.getNamespace(),
+                podName, 8080, "/cluster1/StoreInSession");
     }
 
+    /**
+     * This test starts with a high number of pods. We do lots of HTTP requests
+     * sequentially, with a delay of 1 second between them.
+     * 
+     * In paralel, after every N requests we scale down the cluster by 1 pod.
+     * This happens in another thread and continues until we reach only one pod
+     * in activity.
+     * 
+     * The HTTP requests must continue to work correctly, as the openshift router
+     * should redirect them to any working pod.
+     * 
+     * @param url
+     * @throws Exception
+     */
     @Test
     @RunAsClient
     @Ignore
@@ -108,7 +156,6 @@ public class Eap64ClusterTest {
         int replicas = REPLICAS;
         adapter.scaleDeployment("eap-app", replicas);
 
-        HttpClient client = HttpClientBuilder.untrustedConnectionClient();
         HttpRequest request = HttpClientBuilder.doGET(url.toString() + "/cluster1/Hi");
 
         // Do the requests
@@ -117,33 +164,21 @@ public class Eap64ClusterTest {
             assertEquals(200, response.getResponseCode());
 
             String body = response.getResponseBodyAsString();
-            log.info(String.format("Try %d -  GOT: %s", i,  body));
+            log.info(String.format("Try %d -  GOT: %s", i, body));
             assertTrue(body.startsWith("Served from node: "));
 
             if (i % STEP == 0 && replicas > 1) {
                 replicas--;
                 (new ScaleTo(replicas)).start();
             }
-            
-            Thread.sleep(1000);
-        }
-    }
 
-    public static String readInputStream(InputStream is) throws Exception {
-        try {
-            String content = "";
-            int ch;
-            while ((ch = is.read()) != -1) {
-                content += ((char) ch);
-            }
-            return content;
-        } finally {
-            is.close();
+            Thread.sleep(1000);
         }
     }
 
     private class ScaleTo extends Thread {
         int r;
+
         public ScaleTo(int r) {
             log.info(String.format("ScaleTo created with %d replicas\n", r));
             this.r = r;
