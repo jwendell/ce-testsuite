@@ -342,7 +342,8 @@
                                     } 
                                 ],
                                  "readinessProbe": {
-                                    "tcpSocket": {
+                                    "httpGet": {
+                                        "path": "/",
                                         "port": 8080
                                     },
                                     "initialDelaySeconds": 5

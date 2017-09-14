@@ -405,7 +405,8 @@
                                     } 
                                 ],
                                  "readinessProbe": {
-                                    "tcpSocket": {
+                                    "httpGet": {
+                                        "path": "/?name=homer&number=simpson",
                                         "port": 8080
                                     },
                                     "initialDelaySeconds": 5
